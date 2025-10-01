@@ -11,14 +11,15 @@ use std::mem;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use super::com;
 use super::{windows_err_to_cpal_err, windows_err_to_cpal_err_message};
-use windows::core::Interface;
 use windows::core::GUID;
+use windows::core::{implement, Interface};
 use windows::Win32::Devices::Properties;
 use windows::Win32::Foundation;
 use windows::Win32::Media::Audio::IAudioRenderClient;
@@ -43,7 +44,8 @@ unsafe impl Sync for IAudioClientWrapper {}
 /// An opaque type that identifies an end point.
 #[derive(Clone)]
 pub struct Device {
-    device: Audio::IMMDevice,
+    device: DeviceType,
+    _notification_client: Option<DeviceNotificationWrapper>,
     /// We cache an uninitialized `IAudioClient` so that we can call functions from it without
     /// having to create/destroy audio clients all the time.
     future_audio_client: Arc<Mutex<Option<IAudioClientWrapper>>>, // TODO: add NonZero around the ptr
@@ -59,11 +61,11 @@ impl DeviceTrait for Device {
     }
 
     fn supports_input(&self) -> bool {
-        self.data_flow() == Audio::eCapture
+        self.data_flow() == Some(Audio::eCapture)
     }
 
     fn supports_output(&self) -> bool {
-        self.data_flow() == Audio::eRender
+        self.data_flow() == Some(Audio::eRender)
     }
 
     fn supported_input_configs(
@@ -124,6 +126,143 @@ impl DeviceTrait for Device {
             data_callback,
             error_callback,
         ))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum DeviceType {
+    Device(Audio::IMMDevice),
+    Default(Arc<Mutex<DefaultDevice>>),
+}
+impl DeviceType {
+    pub fn get(&self) -> Option<Audio::IMMDevice> {
+        match self {
+            DeviceType::Device(device) => Some(device.clone()),
+            DeviceType::Default(device) => device.lock().ok().and_then(|d| d.device.clone()),
+        }
+    }
+}
+
+/// A wrapper around the default device that keeps track of the desired flow/role,
+/// so that it can be updated when the default device changes.
+#[derive(Clone, Debug)]
+struct DefaultDevice {
+    flow: Audio::EDataFlow,
+    role: Audio::ERole,
+    device: Option<Audio::IMMDevice>,
+}
+
+impl DefaultDevice {
+    fn new(flow: Audio::EDataFlow, role: Audio::ERole) -> Self {
+        let device = unsafe { get_enumerator().0.GetDefaultAudioEndpoint(flow, role).ok() };
+        Self { flow, role, device }
+    }
+}
+
+/// Wrapper that automatically registers and unregisters the notification client
+struct DeviceNotificationWrapper {
+    client: Audio::IMMNotificationClient,
+    ref_count: Arc<AtomicUsize>,
+}
+impl DeviceNotificationWrapper {
+    fn new(client: DeviceNotificationClient) -> Result<Self, windows::core::Error> {
+        let notification_client = Audio::IMMNotificationClient::from(client);
+
+        unsafe {
+            get_enumerator()
+                .0
+                .RegisterEndpointNotificationCallback(&notification_client)?;
+        }
+        dbg!("Registered notification client");
+
+        Ok(Self {
+            client: notification_client,
+            ref_count: Arc::new(AtomicUsize::new(1)),
+        })
+    }
+}
+impl Clone for DeviceNotificationWrapper {
+    fn clone(&self) -> Self {
+        dbg!(self.ref_count.fetch_add(1, Ordering::Relaxed));
+        Self {
+            client: self.client.clone(),
+            ref_count: self.ref_count.clone(),
+        }
+    }
+}
+impl Drop for DeviceNotificationWrapper {
+    fn drop(&mut self) {
+        // If we are the last reference, unregister the notification client
+        if dbg!(self.ref_count.fetch_sub(1, Ordering::Relaxed)) == 1 {
+            dbg!("Unregistering notification client");
+            unsafe {
+                get_enumerator()
+                    .0
+                    .UnregisterEndpointNotificationCallback(&self.client)
+                    .ok();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+#[implement(Audio::IMMNotificationClient)]
+/// Used to update the default device when it changes. Only present when the device is a default device.
+struct DeviceNotificationClient {
+    device: Arc<Mutex<DefaultDevice>>,
+}
+
+impl Audio::IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
+    fn OnDefaultDeviceChanged(
+        &self,
+        flow: Audio::EDataFlow,
+        role: Audio::ERole,
+        pwstrdefaultdeviceid: &windows_core::PCWSTR,
+    ) -> windows_core::Result<()> {
+        let mut device = self.device.lock().unwrap();
+
+        dbg!(flow, role, pwstrdefaultdeviceid);
+
+        if device.flow != flow && device.role != role {
+            return Ok(());
+        }
+
+        if pwstrdefaultdeviceid.is_null() {
+            device.device = None;
+            return Ok(());
+        }
+
+        device.device = Some(unsafe { get_enumerator().0.GetDevice(*pwstrdefaultdeviceid)? });
+
+        Ok(())
+    }
+
+    fn OnDeviceStateChanged(
+        &self,
+        _pwstrdeviceid: &windows_core::PCWSTR,
+        _dwnewstate: Audio::DEVICE_STATE,
+    ) -> windows_core::Result<()> {
+        dbg!(_pwstrdeviceid, _dwnewstate);
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, _pwstrdeviceid: &windows_core::PCWSTR) -> windows_core::Result<()> {
+        dbg!(_pwstrdeviceid);
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, _pwstrdeviceid: &windows_core::PCWSTR) -> windows_core::Result<()> {
+        dbg!(_pwstrdeviceid);
+        Ok(())
+    }
+
+    fn OnPropertyValueChanged(
+        &self,
+        _pwstrdeviceid: &windows_core::PCWSTR,
+        _key: &windows::Win32::Foundation::PROPERTYKEY,
+    ) -> windows_core::Result<()> {
+        dbg!(_pwstrdeviceid, _key);
+        Ok(())
     }
 }
 
@@ -275,6 +414,12 @@ impl Device {
             // Open the device's property store.
             let property_store = self
                 .device
+                .get()
+                .ok_or_else(|| {
+                    DeviceNameError::from(BackendSpecificError {
+                        description: "device not found".to_string(),
+                    })
+                })?
                 .OpenPropertyStore(STGM_READ)
                 .expect("could not open property store");
 
@@ -325,13 +470,28 @@ impl Device {
     #[inline]
     fn from_immdevice(device: Audio::IMMDevice) -> Self {
         Device {
-            device,
+            device: DeviceType::Device(device),
+            _notification_client: None,
             future_audio_client: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub fn immdevice(&self) -> &Audio::IMMDevice {
-        &self.device
+    #[inline]
+    fn from_default_device(device: DefaultDevice) -> Result<Self, windows::core::Error> {
+        // Clippy rightfully points out that that `Mutex<DefaultDevice>` is not `Send` or `Sync`,
+        // but it's unclear whether or not notifications are sent from a different thread,
+        // so we're being conservative here and using `Arc`/`Mutex` anyway.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let device = Arc::new(Mutex::new(device));
+        let notification_client = DeviceNotificationWrapper::new(DeviceNotificationClient {
+            device: device.clone(),
+        })?;
+
+        Ok(Device {
+            device: DeviceType::Default(device),
+            _notification_client: Some(notification_client),
+            future_audio_client: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Ensures that `future_audio_client` contains a `Some` and returns a locked mutex to it.
@@ -346,7 +506,13 @@ impl Device {
         let audio_client: Audio::IAudioClient = unsafe {
             // can fail if the device has been disconnected since we enumerated it, or if
             // the device doesn't support playback for some reason
-            self.device.Activate(Com::CLSCTX_ALL, None)?
+            let device = self.device.get().ok_or_else(|| {
+                windows::core::Error::new(
+                    Audio::AUDCLNT_E_DEVICE_INVALIDATED,
+                    "device not found when ensuring future audio client",
+                )
+            })?;
+            device.Activate(Com::CLSCTX_ALL, None)?
         };
 
         *lock = Some(IAudioClientWrapper(audio_client));
@@ -463,7 +629,7 @@ impl Device {
     pub fn supported_input_configs(
         &self,
     ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
-        if self.data_flow() == Audio::eCapture {
+        if self.data_flow() == Some(Audio::eCapture) {
             self.supported_formats()
         // If it's an output device, assume no input formats.
         } else {
@@ -474,7 +640,7 @@ impl Device {
     pub fn supported_output_configs(
         &self,
     ) -> Result<SupportedOutputConfigs, SupportedStreamConfigsError> {
-        if self.data_flow() == Audio::eRender {
+        if self.data_flow() == Some(Audio::eRender) {
             self.supported_formats()
         // If it's an input device, assume no output formats.
         } else {
@@ -514,13 +680,13 @@ impl Device {
         }
     }
 
-    pub(crate) fn data_flow(&self) -> Audio::EDataFlow {
-        let endpoint = Endpoint::from(self.device.clone());
-        endpoint.data_flow()
+    pub(crate) fn data_flow(&self) -> Option<Audio::EDataFlow> {
+        let endpoint = Endpoint::from(self.device.get()?);
+        Some(endpoint.data_flow())
     }
 
     pub fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        if self.data_flow() == Audio::eCapture {
+        if self.data_flow() == Some(Audio::eCapture) {
             self.default_format()
         } else {
             Err(DefaultStreamConfigError::StreamTypeNotSupported)
@@ -529,7 +695,7 @@ impl Device {
 
     pub fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
         let data_flow = self.data_flow();
-        if data_flow == Audio::eRender {
+        if data_flow == Some(Audio::eRender) {
             self.default_format()
         } else {
             Err(DefaultStreamConfigError::StreamTypeNotSupported)
@@ -564,7 +730,7 @@ impl Device {
 
             let mut stream_flags = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 
-            if self.data_flow() == Audio::eRender {
+            if self.data_flow() == Some(Audio::eRender) {
                 stream_flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
             }
 
@@ -766,40 +932,49 @@ impl Device {
 impl PartialEq for Device {
     #[inline]
     fn eq(&self, other: &Device) -> bool {
-        // Use case: In order to check whether the default device has changed
-        // the client code might need to compare the previous default device with the current one.
-        // The pointer comparison (`self.device == other.device`) don't work there,
-        // because the pointers are different even when the default device stays the same.
-        //
-        // In this code section we're trying to use the GetId method for the device comparison, cf.
-        // https://docs.microsoft.com/en-us/windows/desktop/api/mmdeviceapi/nf-mmdeviceapi-immdevice-getid
-        unsafe {
-            struct IdRAII(windows::core::PWSTR);
-            /// RAII for device IDs.
-            impl Drop for IdRAII {
-                fn drop(&mut self) {
-                    unsafe { Com::CoTaskMemFree(Some(self.0 .0 as *mut _)) }
+        let device1 = self.device.get();
+        let device2 = other.device.get();
+
+        match (device1, device2) {
+            (Some(device1), Some(device2)) => {
+                // Use case: In order to check whether the default device has changed
+                // the client code might need to compare the previous default device with the current one.
+                // The pointer comparison (`self.device == other.device`) don't work there,
+                // because the pointers are different even when the default device stays the same.
+                //
+                // In this code section we're trying to use the GetId method for the device comparison, cf.
+                // https://docs.microsoft.com/en-us/windows/desktop/api/mmdeviceapi/nf-mmdeviceapi-immdevice-getid
+                unsafe {
+                    struct IdRAII(windows::core::PWSTR);
+                    /// RAII for device IDs.
+                    impl Drop for IdRAII {
+                        fn drop(&mut self) {
+                            unsafe { Com::CoTaskMemFree(Some(self.0 .0 as *mut _)) }
+                        }
+                    }
+                    // GetId only fails with E_OUTOFMEMORY and if it does, we're probably dead already.
+                    // Plus it won't do to change the device comparison logic unexpectedly.
+                    let id1 = device1.GetId().expect("cpal: GetId failure");
+                    let id1 = IdRAII(id1);
+                    let id2 = device2.GetId().expect("cpal: GetId failure");
+                    let id2 = IdRAII(id2);
+                    // 16-bit null-terminated comparison.
+                    let mut offset = 0;
+                    loop {
+                        let w1: u16 = *(id1.0).0.offset(offset);
+                        let w2: u16 = *(id2.0).0.offset(offset);
+                        if w1 == 0 && w2 == 0 {
+                            return true;
+                        }
+                        if w1 != w2 {
+                            return false;
+                        }
+                        offset += 1;
+                    }
                 }
             }
-            // GetId only fails with E_OUTOFMEMORY and if it does, we're probably dead already.
-            // Plus it won't do to change the device comparison logic unexpectedly.
-            let id1 = self.device.GetId().expect("cpal: GetId failure");
-            let id1 = IdRAII(id1);
-            let id2 = other.device.GetId().expect("cpal: GetId failure");
-            let id2 = IdRAII(id2);
-            // 16-bit null-terminated comparison.
-            let mut offset = 0;
-            loop {
-                let w1: u16 = *(id1.0).0.offset(offset);
-                let w2: u16 = *(id2.0).0.offset(offset);
-                if w1 == 0 && w2 == 0 {
-                    return true;
-                }
-                if w1 != w2 {
-                    return false;
-                }
-                offset += 1;
-            }
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
         }
     }
 }
@@ -911,23 +1086,16 @@ impl Iterator for Devices {
     }
 }
 
-fn default_device(data_flow: Audio::EDataFlow) -> Option<Device> {
-    unsafe {
-        let device = get_enumerator()
-            .0
-            .GetDefaultAudioEndpoint(data_flow, Audio::eConsole)
-            .ok()?;
-        // TODO: check specifically for `E_NOTFOUND`, and panic otherwise
-        Some(Device::from_immdevice(device))
-    }
+fn default_device(data_flow: Audio::EDataFlow) -> Result<Device, windows::core::Error> {
+    Device::from_default_device(DefaultDevice::new(data_flow, Audio::eConsole))
 }
 
 pub fn default_input_device() -> Option<Device> {
-    default_device(Audio::eCapture)
+    default_device(Audio::eCapture).ok()
 }
 
 pub fn default_output_device() -> Option<Device> {
-    default_device(Audio::eRender)
+    default_device(Audio::eRender).ok()
 }
 
 /// Get the audio clock used to produce `StreamInstant`s.
