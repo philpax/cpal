@@ -11,15 +11,13 @@ use std::mem;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use super::com;
 use super::{windows_err_to_cpal_err, windows_err_to_cpal_err_message};
+use windows::core::Interface;
 use windows::core::GUID;
-use windows::core::{implement, Interface};
 use windows::Win32::Devices::Properties;
 use windows::Win32::Foundation;
 use windows::Win32::Media::Audio::IAudioRenderClient;
@@ -29,6 +27,7 @@ use windows::Win32::System::Com::{StructuredStorage, STGM_READ};
 use windows::Win32::System::Threading;
 use windows::Win32::System::Variant::VT_LPWSTR;
 
+use super::get_enumerator;
 use super::stream::{AudioClientFlow, Stream, StreamInner};
 use crate::{traits::DeviceTrait, BuildStreamError, StreamError};
 
@@ -45,7 +44,6 @@ unsafe impl Sync for IAudioClientWrapper {}
 #[derive(Clone)]
 pub struct Device {
     device: DeviceType,
-    _notification_client: Option<DeviceNotificationWrapper>,
     /// We cache an uninitialized `IAudioClient` so that we can call functions from it without
     /// having to create/destroy audio clients all the time.
     future_audio_client: Arc<Mutex<Option<IAudioClientWrapper>>>, // TODO: add NonZero around the ptr
@@ -145,124 +143,17 @@ impl DeviceType {
 
 /// A wrapper around the default device that keeps track of the desired flow/role,
 /// so that it can be updated when the default device changes.
-#[derive(Clone, Debug)]
-struct DefaultDevice {
-    flow: Audio::EDataFlow,
-    role: Audio::ERole,
-    device: Option<Audio::IMMDevice>,
+#[derive(Debug)]
+pub(super) struct DefaultDevice {
+    pub flow: Audio::EDataFlow,
+    pub role: Audio::ERole,
+    pub device: Option<Audio::IMMDevice>,
 }
 
 impl DefaultDevice {
-    fn new(flow: Audio::EDataFlow, role: Audio::ERole) -> Self {
+    pub fn new(flow: Audio::EDataFlow, role: Audio::ERole) -> Self {
         let device = unsafe { get_enumerator().0.GetDefaultAudioEndpoint(flow, role).ok() };
         Self { flow, role, device }
-    }
-}
-
-/// Wrapper that automatically registers and unregisters the notification client
-struct DeviceNotificationWrapper {
-    client: Audio::IMMNotificationClient,
-    ref_count: Arc<AtomicUsize>,
-}
-impl DeviceNotificationWrapper {
-    fn new(client: DeviceNotificationClient) -> Result<Self, windows::core::Error> {
-        let notification_client = Audio::IMMNotificationClient::from(client);
-
-        unsafe {
-            get_enumerator()
-                .0
-                .RegisterEndpointNotificationCallback(&notification_client)?;
-        }
-        dbg!("Registered notification client");
-
-        Ok(Self {
-            client: notification_client,
-            ref_count: Arc::new(AtomicUsize::new(1)),
-        })
-    }
-}
-impl Clone for DeviceNotificationWrapper {
-    fn clone(&self) -> Self {
-        dbg!(self.ref_count.fetch_add(1, Ordering::Relaxed));
-        Self {
-            client: self.client.clone(),
-            ref_count: self.ref_count.clone(),
-        }
-    }
-}
-impl Drop for DeviceNotificationWrapper {
-    fn drop(&mut self) {
-        // If we are the last reference, unregister the notification client
-        if dbg!(self.ref_count.fetch_sub(1, Ordering::Relaxed)) == 1 {
-            dbg!("Unregistering notification client");
-            unsafe {
-                get_enumerator()
-                    .0
-                    .UnregisterEndpointNotificationCallback(&self.client)
-                    .ok();
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-#[implement(Audio::IMMNotificationClient)]
-/// Used to update the default device when it changes. Only present when the device is a default device.
-struct DeviceNotificationClient {
-    device: Arc<Mutex<DefaultDevice>>,
-}
-
-impl Audio::IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
-    fn OnDefaultDeviceChanged(
-        &self,
-        flow: Audio::EDataFlow,
-        role: Audio::ERole,
-        pwstrdefaultdeviceid: &windows_core::PCWSTR,
-    ) -> windows_core::Result<()> {
-        let mut device = self.device.lock().unwrap();
-
-        dbg!(flow, role, pwstrdefaultdeviceid);
-
-        if device.flow != flow && device.role != role {
-            return Ok(());
-        }
-
-        if pwstrdefaultdeviceid.is_null() {
-            device.device = None;
-            return Ok(());
-        }
-
-        device.device = Some(unsafe { get_enumerator().0.GetDevice(*pwstrdefaultdeviceid)? });
-
-        Ok(())
-    }
-
-    fn OnDeviceStateChanged(
-        &self,
-        _pwstrdeviceid: &windows_core::PCWSTR,
-        _dwnewstate: Audio::DEVICE_STATE,
-    ) -> windows_core::Result<()> {
-        dbg!(_pwstrdeviceid, _dwnewstate);
-        Ok(())
-    }
-
-    fn OnDeviceAdded(&self, _pwstrdeviceid: &windows_core::PCWSTR) -> windows_core::Result<()> {
-        dbg!(_pwstrdeviceid);
-        Ok(())
-    }
-
-    fn OnDeviceRemoved(&self, _pwstrdeviceid: &windows_core::PCWSTR) -> windows_core::Result<()> {
-        dbg!(_pwstrdeviceid);
-        Ok(())
-    }
-
-    fn OnPropertyValueChanged(
-        &self,
-        _pwstrdeviceid: &windows_core::PCWSTR,
-        _key: &windows::Win32::Foundation::PROPERTYKEY,
-    ) -> windows_core::Result<()> {
-        dbg!(_pwstrdeviceid, _key);
-        Ok(())
     }
 }
 
@@ -471,25 +362,16 @@ impl Device {
     fn from_immdevice(device: Audio::IMMDevice) -> Self {
         Device {
             device: DeviceType::Device(device),
-            _notification_client: None,
             future_audio_client: Arc::new(Mutex::new(None)),
         }
     }
 
     #[inline]
-    fn from_default_device(device: DefaultDevice) -> Result<Self, windows::core::Error> {
-        // Clippy rightfully points out that that `Mutex<DefaultDevice>` is not `Send` or `Sync`,
-        // but it's unclear whether or not notifications are sent from a different thread,
-        // so we're being conservative here and using `Arc`/`Mutex` anyway.
-        #[allow(clippy::arc_with_non_send_sync)]
-        let device = Arc::new(Mutex::new(device));
-        let notification_client = DeviceNotificationWrapper::new(DeviceNotificationClient {
-            device: device.clone(),
-        })?;
-
-        Ok(Device {
+    pub(super) fn from_default_device(device: Arc<Mutex<DefaultDevice>>) -> Option<Self> {
+        // If the device is not currently available, return None.
+        device.lock().unwrap().device.as_ref()?;
+        Some(Device {
             device: DeviceType::Default(device),
-            _notification_client: Some(notification_client),
             future_audio_client: Arc::new(Mutex::new(None)),
         })
     }
@@ -1005,34 +887,6 @@ impl Endpoint {
     }
 }
 
-static ENUMERATOR: OnceLock<Enumerator> = OnceLock::new();
-
-fn get_enumerator() -> &'static Enumerator {
-    ENUMERATOR.get_or_init(|| {
-        // COM initialization is thread local, but we only need to have COM initialized in the
-        // thread we create the objects in
-        com::com_initialized();
-
-        // building the devices enumerator object
-        unsafe {
-            let enumerator = Com::CoCreateInstance::<_, Audio::IMMDeviceEnumerator>(
-                &Audio::MMDeviceEnumerator,
-                None,
-                Com::CLSCTX_ALL,
-            )
-            .unwrap();
-
-            Enumerator(enumerator)
-        }
-    })
-}
-
-/// Send/Sync wrapper around `IMMDeviceEnumerator`.
-struct Enumerator(Audio::IMMDeviceEnumerator);
-
-unsafe impl Send for Enumerator {}
-unsafe impl Sync for Enumerator {}
-
 /// WASAPI implementation for `Devices`.
 pub struct Devices {
     collection: Audio::IMMDeviceCollection,
@@ -1084,18 +938,6 @@ impl Iterator for Devices {
         let num = num as usize;
         (num, Some(num))
     }
-}
-
-fn default_device(data_flow: Audio::EDataFlow) -> Result<Device, windows::core::Error> {
-    Device::from_default_device(DefaultDevice::new(data_flow, Audio::eConsole))
-}
-
-pub fn default_input_device() -> Option<Device> {
-    default_device(Audio::eCapture).ok()
-}
-
-pub fn default_output_device() -> Option<Device> {
-    default_device(Audio::eRender).ok()
 }
 
 /// Get the audio clock used to produce `StreamInstant`s.
